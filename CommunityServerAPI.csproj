@@ -8,4 +8,9 @@
     <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
   </PropertyGroup>
 
+
+  <ItemGroup>
+    <PackageReference Include="DiscordWebhooks" Version="1.0.4" />
+  </ItemGroup>
+
 </Project>
