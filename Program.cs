@@ -45,6 +45,9 @@ class Program
         
         listener.OnGameServerConnected += OnGameServerConnected;
         
+        if(UTILS.DEBUG)
+            Console.WriteLine("WARNING! DEBUG mode is on. This means that every player will have access to admin commands.");
+        
         Console.WriteLine("Listening on port " + port);
 
         if (args.Length > 0)
