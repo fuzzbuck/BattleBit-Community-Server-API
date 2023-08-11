@@ -31,6 +31,8 @@ class Program
         var listener = new ServerListener<_Player, _GameServer>();
         listener.Start(port);
         
+        listener.OnGameServerConnected += OnGameServerConnected;
+        
         Console.WriteLine("listening on port " + port);
 
         if (args.Length > 0)
@@ -44,6 +46,14 @@ class Program
         }
 
         Thread.Sleep(-1);
+    }
+
+    private static async Task OnGameServerConnected(GameServer<_Player> arg)
+    {
+        Console.WriteLine("New game server connected from " + arg.GameIP + " on map " + arg.Map + " with " + arg.MaxPlayers + " slots.");
+        Console.WriteLine("Gamemode: " + arg.Gamemode);
+        Console.WriteLine("Map size: " + arg.MapSize);
+        Console.WriteLine("Server name: " + arg.ServerName);
     }
 }
 
