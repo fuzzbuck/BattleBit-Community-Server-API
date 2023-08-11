@@ -148,7 +148,7 @@ class _GameServer : GameServer<_Player>
         }
 
         RoundSettings.TeamATickets = GetTeamCount(Team.TeamA);
-        RoundSettings.TeamBTickets = GetTeamCount(Team.TeamA);
+        RoundSettings.TeamBTickets = GetTeamCount(Team.TeamB);
         
         await Task.Delay(1000);
     }
