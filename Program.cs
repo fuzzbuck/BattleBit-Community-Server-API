@@ -14,11 +14,23 @@ static class UTILS
     // change this to 'false' in production to not make everyone admin
     public static bool DEBUG = true;
     
-    public static void SendWebhook(String msg)
+    // chat logs
+    public static String LOGS = "";
+
+    public static void LogChat(_Player from, String msg)
+    {
+        LOGS += from.Name + ":" + from.SteamID + " => " + msg.Replace("@", "").Replace("`", "") + "\n";
+        
+        // send in batches
+        if (LOGS.Length > 500)
+            SendWebhook(LOGS, "Chat Logs");
+    }
+    
+    public static void SendWebhook(String msg, String name = "Battlebit API")
     {
         webhook?.PostData(new WebhookObject
         {
-            username = "battlebit",
+            username = name,
             content = msg
         });
     }
@@ -33,16 +45,17 @@ class Program
         
         listener.OnGameServerConnected += OnGameServerConnected;
         
-        Console.WriteLine("listening on port " + port);
+        Console.WriteLine("Listening on port " + port);
 
         if (args.Length > 0)
         {
             UTILS.webhook = new Webhook(args[1]);
-            Console.WriteLine("discord webhook enabled");
+            UTILS.SendWebhook("API started.");
+            Console.WriteLine("Discord webhook enabled");
         }
         else
         {
-            Console.WriteLine("discord webhook disabled, pass webhook url as first argument to enable");
+            Console.WriteLine("Discord webhook disabled, pass webhook url as first argument to enable");
         }
 
         Thread.Sleep(-1);
@@ -287,6 +300,8 @@ class _GameServer : GameServer<_Player>
 
             return false;
         }
+        
+        UTILS.LogChat(player, msg);
 
         return true;
     }
