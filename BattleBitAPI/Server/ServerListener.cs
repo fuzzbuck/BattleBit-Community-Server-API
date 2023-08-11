@@ -354,7 +354,7 @@ namespace BattleBitAPI.Server
                             readStream.Reset();
                             if (!await networkStream.TryRead(readStream, roomSize, source.Token))
                                 throw new Exception("Unable to read the room");
-                            resources._Settings.Read(readStream);
+                            resources._RoomSettings.Read(readStream);
                         }
 
                         //Map&gamemode rotation
@@ -383,6 +383,14 @@ namespace BattleBitAPI.Server
                                 if (readStream.TryReadString(out var item))
                                     resources._GamemodeRotation.Add(item);
                             }
+                        }
+
+                        //Round Settings
+                        {
+                            readStream.Reset();
+                            if (!await networkStream.TryRead(readStream, GameServer<TPlayer>.mRoundSettings.Size, source.Token))
+                                throw new Exception("Unable to read the round settings");
+                            resources._RoundSettings.Read(readStream);
                         }
 
                         //Client Count
@@ -571,11 +579,21 @@ namespace BattleBitAPI.Server
         }
         private async Task mHandleGameServer(TGameServer server)
         {
+            bool isTicking = false;
+
             using (server)
             {
+                async Task mTickAsync()
+                {
+                    isTicking = true;
+                    await server.OnTick();
+                    isTicking = false;
+                }
+
                 while (server.IsConnected)
                 {
-                    server.OnTick();
+                    if (!isTicking)
+                        mTickAsync();
 
                     await server.Tick();
                     await Task.Delay(10);
@@ -585,7 +603,7 @@ namespace BattleBitAPI.Server
                 {
                     server.OnDisconnected();
 
-                    if (this.OnGameServerDisconnected!= null)
+                    if (this.OnGameServerDisconnected != null)
                         this.OnGameServerDisconnected(server);
                 }
             }
@@ -969,7 +987,57 @@ namespace BattleBitAPI.Server
                         }
                         break;
                     }
+                case NetworkCommuncation.NotifyNewRoundState:
+                    {
+                        if (stream.CanRead(GameServer<TPlayer>.mRoundSettings.Size))
+                        {
+                            var oldState = resources._RoundSettings.State;
+                            resources._RoundSettings.Read(stream);
+                            var newState = resources._RoundSettings.State;
+
+                            if (newState != oldState)
+                            {
+                                server.OnGameStateChanged(oldState, newState);
+
+                                if (newState == GameState.Playing)
+                                    server.OnRoundStarted();
+                                else if (newState == GameState.EndingGame)
+                                    server.OnRoundEnded();
+                            }
+                        }
+                        break;
+                    }
             }
+        }
+
+        // --- Public ---
+        public IEnumerable<TGameServer> ConnectedGameServers
+        {
+            get
+            {
+                var list = new List<TGameServer>(mActiveConnections.Count);
+                lock (mActiveConnections)
+                {
+                    foreach (var item in mActiveConnections.Values)
+                        list.Add(item.server);
+                }
+                return list;
+            }
+        }
+        public bool TryGetGameServer(IPAddress ip, ushort port, out TGameServer server)
+        {
+            var hash = ((ulong)port << 32) | (ulong)ip.ToUInt();
+            lock (mActiveConnections)
+            {
+                if (mActiveConnections.TryGetValue(hash, out var _server))
+                {
+                    server = (TGameServer)_server.server;
+                    return true;
+                }
+            }
+
+            server = default;
+            return false;
         }
 
         // --- Disposing --- 
