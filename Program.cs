@@ -164,6 +164,10 @@ class _GameServer : GameServer<_Player>
 
     public override async Task OnPlayerSpawned(_Player player)
     {
+        // revert admin commands to default upon respawn
+        player.SetGiveDamageMultiplier(1f);
+        player.SetReceiveDamageMultiplier(1f);
+        
         player.Message(INSTRUCTIONS);
     }
 
@@ -235,6 +239,7 @@ class _GameServer : GameServer<_Player>
 
             if (cmd == "warn" && args.Length >= 2)
             {
+                // warn all players
                 if (args[0] == "all")
                 {
                     foreach (var item in AllPlayers)
@@ -242,6 +247,7 @@ class _GameServer : GameServer<_Player>
                         WarnPlayer(item, String.Join(" ", args.Skip(1).ToArray()));
                     }
                 }
+                // warn a single player
                 else
                 {
                     var to = FindPlayer(args[0]);
@@ -251,9 +257,32 @@ class _GameServer : GameServer<_Player>
                 }
             }
 
+            if (cmd == "kill" && args.Length >= 2)
+            {
+                var to = FindPlayer(args[0]);
+                    
+                if (to != null)
+                    Kill(to);
+            }
+
             if (cmd == "announce" && args.Length >= 1)
             {
                 AnnounceLong(String.Join(" ", args.ToArray()));
+            }
+
+            if (cmd == "opdeagle")
+            {
+                SetSecondaryWeapon(player, new WeaponItem
+                {
+                    Tool = Weapons.DesertEagle,
+                    MainSight = Attachments._20xScope,
+                    CantedSight = Attachments.FYouSight,
+                    SideRail = Attachments.Redlaser,
+                    UnderRail = Attachments.AngledGrip,
+                    Barrel = Attachments.SuppressorLong
+                    
+                }, 8, true);
+                SetGiveDamageMultiplier(player, 10);
             }
 
             return false;
