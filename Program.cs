@@ -175,7 +175,8 @@ class _GameServer : GameServer<_Player>
 
     public override async Task OnPlayerConnected(_Player player)
     {
-        player.Team = FindLowestTeam();
+        if (player.Team != FindLowestTeam())
+            player.ChangeTeam();
     }
 
     public override async Task OnPlayerSpawned(_Player player)
@@ -189,7 +190,8 @@ class _GameServer : GameServer<_Player>
 
     public override async Task OnAPlayerKilledAnotherPlayer(OnPlayerKillArguments<_Player> args)
     {
-        args.Victim.Team = args.Killer.Team;
+        args.Victim.ChangeTeam();
+        
         args.Victim.SpawnPlayer(
             args.Killer.CurrentLoadout,
             args.Killer.CurrentWearings,
