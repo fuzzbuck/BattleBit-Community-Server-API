@@ -181,6 +181,16 @@ class _GameServer : GameServer<_Player>
         args.Victim.Message("You have been cloned by " + args.Killer.Name + ".");
     }
 
+    public override async Task OnPlayerReported(_Player from, _Player to, ReportReason reason, string additional)
+    {
+        UTILS.SendWebhook(
+            "New report from: " + from.Name + ":" + from.SteamID
+            + ", target: " + to.Name + ":" + to.SteamID
+            + ", reason: " + reason
+            + ", additional: " + additional
+            );
+    }
+
     public override async Task<bool> OnPlayerTypedMessage(_Player player, ChatChannel channel, string msg)
     {
         if (msg.StartsWith("/") && msg.Length > 1)
