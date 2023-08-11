@@ -38,11 +38,11 @@ class Program
         if (args.Length > 0)
         {
             UTILS.webhook = new Webhook(args[1]);
-            Console.WriteLine("webhook enabled");
+            Console.WriteLine("discord webhook enabled");
         }
         else
         {
-            Console.WriteLine("no discord webhook is provided!");
+            Console.WriteLine("discord webhook disabled, pass webhook url as first argument to enable");
         }
 
         Thread.Sleep(-1);
