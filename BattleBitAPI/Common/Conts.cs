@@ -1,7 +1,9 @@
-﻿namespace CommunityServerAPI.BattleBitAPI
+﻿namespace BattleBitAPI
 {
     public static class Const
     {
+        public static string Version = "1.0.4v";
+
         // ---- Networking ---- 
         /// <summary>
         /// Maximum data size for a single package. 4MB is default.
@@ -28,11 +30,13 @@
         public const int MinServerNameLength = 5;
         public const int MaxServerNameLength = 400;
 
+        public const int MaxTokenSize = 512;
+
         public const int MinGamemodeNameLength = 2;
-        public const int MaxGamemodeNameLength = 12;
+        public const int MaxGamemodeNameLength = 64;
 
         public const int MinMapNameLength = 2;
-        public const int MaxMapNameLength = 36;
+        public const int MaxMapNameLength = 64;
 
         public const int MinLoadingScreenTextLength = 0;
         public const int MaxLoadingScreenTextLength = 1024 * 8;

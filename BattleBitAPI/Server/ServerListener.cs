@@ -1,12 +1,12 @@
-﻿using System.Net;
-using System.Net.Security;
+﻿using System.Data;
+using System.Net;
 using System.Net.Sockets;
 using System.Numerics;
+using System.Resources;
 using BattleBitAPI.Common;
 using BattleBitAPI.Common.Extentions;
-using BattleBitAPI.Common.Serialization;
 using BattleBitAPI.Networking;
-using CommunityServerAPI.BattleBitAPI;
+using BattleBitAPI.Pooling;
 
 namespace BattleBitAPI.Server
 {
@@ -16,6 +16,7 @@ namespace BattleBitAPI.Server
         public bool IsListening { get; private set; }
         public bool IsDisposed { get; private set; }
         public int ListeningPort { get; private set; }
+        public LogLevel LogLevel { get; set; } = LogLevel.None;
 
         // --- Events --- 
         /// <summary>
@@ -33,6 +34,22 @@ namespace BattleBitAPI.Server
         public Func<IPAddress, Task<bool>> OnGameServerConnecting { get; set; }
 
         /// <summary>
+        /// Fired when server needs to validate token from incoming connection.<br/>
+        /// Default, any connection attempt will be accepted
+        /// </summary>
+        /// 
+        /// <remarks>
+        /// IPAddress: IP of incoming connection <br/>
+        /// ushort: Game Port of the connection <br/>
+        /// string: Token of connection<br/>
+        /// </remarks>
+        /// 
+        /// <value>
+        /// Returns: true if allow connection, false if deny the connection.
+        /// </value>
+        public Func<IPAddress, ushort, string, Task<bool>> OnValidateGameServerToken { get; set; }
+
+        /// <summary>
         /// Fired when a game server connects.
         /// </summary>
         /// 
@@ -40,15 +57,6 @@ namespace BattleBitAPI.Server
         /// GameServer: Game server that is connecting.<br/>
         /// </remarks>
         public Func<GameServer<TPlayer>, Task> OnGameServerConnected { get; set; }
-
-        /// <summary>
-        /// Fired when a game server reconnects. (When game server connects while a socket is already open)
-        /// </summary>
-        /// 
-        /// <remarks>
-        /// GameServer: Game server that is reconnecting.<br/>
-        /// </remarks>
-        public Func<GameServer<TPlayer>, Task> OnGameServerReconnected { get; set; }
 
         /// <summary>
         /// Fired when a game server disconnects. Check (GameServer.TerminationReason) to see the reason.
@@ -59,16 +67,49 @@ namespace BattleBitAPI.Server
         /// </remarks>
         public Func<GameServer<TPlayer>, Task> OnGameServerDisconnected { get; set; }
 
+        /// <summary>
+        /// Fired when a new instance of game server created.
+        /// </summary>
+        /// 
+        /// <remarks>
+        /// IPAddress: Game server's IP.<br/>
+        /// ushort: Game server's Port.<br/>
+        /// </remarks>
+        public Func<IPAddress, ushort, TGameServer> OnCreatingGameServerInstance { get; set; }
+
+        /// <summary>
+        /// Fired when a new instance of player instance created.
+        /// </summary>
+        /// 
+        /// <remarks>
+        /// TPlayer: The player instance that was created<br/>
+        /// ulong: The steamID of the player<br/>
+        /// </remarks>
+        public Func<ulong, TPlayer> OnCreatingPlayerInstance { get; set; }
+
+        /// <summary>
+        /// Fired on log
+        /// </summary>
+        /// 
+        /// <remarks>
+        /// LogLevel: The level of log<br/>
+        /// string: The message<br/>
+        /// object: The object that will be carried on log<br/>
+        /// </remarks>
+        public Action<LogLevel, string, object?> OnLog { get; set; }
+
         // --- Private --- 
         private TcpListener mSocket;
         private Dictionary<ulong, (TGameServer server, GameServer<TPlayer>.Internal resources)> mActiveConnections;
         private mInstances<TPlayer, TGameServer> mInstanceDatabase;
+        private ItemPooling<GameServer<TPlayer>> mGameServerPool;
 
         // --- Construction --- 
         public ServerListener()
         {
             this.mActiveConnections = new Dictionary<ulong, (TGameServer, GameServer<TPlayer>.Internal)>(16);
             this.mInstanceDatabase = new mInstances<TPlayer, TGameServer>();
+            this.mGameServerPool = new ItemPooling<GameServer<TPlayer>>(64);
         }
 
         // --- Starting ---
@@ -87,11 +128,14 @@ namespace BattleBitAPI.Server
             this.ListeningPort = port;
             this.IsListening = true;
 
+            if (this.LogLevel.HasFlag(LogLevel.Sockets))
+                OnLog(LogLevel.Sockets, $"Listening TCP connections on port " + port, null);
+
             mMainLoop();
         }
         public void Start(int port)
         {
-            Start(IPAddress.Loopback, port);
+            Start(IPAddress.Any, port);
         }
 
         // --- Stopping ---
@@ -107,6 +151,9 @@ namespace BattleBitAPI.Server
                 mSocket.Stop();
             }
             catch { }
+
+            if (this.LogLevel.HasFlag(LogLevel.Sockets))
+                OnLog(LogLevel.Sockets, $"Stopped listening TCP connection.", null);
 
             this.mSocket = null;
             this.ListeningPort = 0;
@@ -126,22 +173,32 @@ namespace BattleBitAPI.Server
         {
             var ip = (client.Client.RemoteEndPoint as IPEndPoint).Address;
 
+            if (this.LogLevel.HasFlag(LogLevel.Sockets))
+                OnLog(LogLevel.Sockets, $"Incoming TCP connection from {ip}", client);
+
+            //Is this IP allowed?
             bool allow = true;
             if (OnGameServerConnecting != null)
                 allow = await OnGameServerConnecting(ip);
 
+            //Close connection if it was not allowed.
             if (!allow)
             {
+                if (this.LogLevel.HasFlag(LogLevel.Sockets))
+                    OnLog(LogLevel.Sockets, $"Incoming connection from {ip} was denied", client);
+
                 //Connection is not allowed from this IP.
                 client.SafeClose();
                 return;
             }
 
-            TGameServer server = null;
-            GameServer<TPlayer>.Internal resources;
+            //Read port,token,version
+            string token;
+            string version;
+            int gamePort;
             try
             {
-                using (CancellationTokenSource source = new CancellationTokenSource(Const.HailConnectTimeout))
+                using (var source = new CancellationTokenSource(2000))
                 {
                     using (var readStream = Common.Serialization.Stream.Get())
                     {
@@ -152,21 +209,108 @@ namespace BattleBitAPI.Server
                             readStream.Reset();
                             if (!await networkStream.TryRead(readStream, 1, source.Token))
                                 throw new Exception("Unable to read the package type");
+
                             NetworkCommuncation type = (NetworkCommuncation)readStream.ReadInt8();
                             if (type != NetworkCommuncation.Hail)
                                 throw new Exception("Incoming package wasn't hail.");
                         }
 
+                        //Read the server token
+                        {
+                            readStream.Reset();
+                            if (!await networkStream.TryRead(readStream, 2, source.Token))
+                                throw new Exception("Unable to read the Token Size");
+
+                            int stringSize = readStream.ReadUInt16();
+                            if (stringSize > Const.MaxTokenSize)
+                                throw new Exception("Invalid token size");
+
+                            readStream.Reset();
+                            if (!await networkStream.TryRead(readStream, stringSize, source.Token))
+                                throw new Exception("Unable to read the token");
+
+                            token = readStream.ReadString(stringSize);
+                        }
+
+                        //Read the server version
+                        {
+                            readStream.Reset();
+                            if (!await networkStream.TryRead(readStream, 2, source.Token))
+                                throw new Exception("Unable to read the version size");
+
+                            int stringSize = readStream.ReadUInt16();
+                            if (stringSize > 32)
+                                throw new Exception("Invalid version size");
+
+                            readStream.Reset();
+                            if (!await networkStream.TryRead(readStream, stringSize, source.Token))
+                                throw new Exception("Unable to read the version");
+
+                            version = readStream.ReadString(stringSize);
+                        }
+
                         //Read port
-                        int gamePort;
                         {
                             readStream.Reset();
                             if (!await networkStream.TryRead(readStream, 2, source.Token))
                                 throw new Exception("Unable to read the Port");
                             gamePort = readStream.ReadUInt16();
                         }
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                if (this.LogLevel.HasFlag(LogLevel.Sockets))
+                    OnLog(LogLevel.Sockets, $"{ip} failed to connected because " + e.Message, client);
 
-                        //Read is Port protected
+                client.SafeClose();
+                return;
+            }
+
+            var hash = ((ulong)gamePort << 32) | (ulong)ip.ToUInt();
+            TGameServer server = null;
+            GameServer<TPlayer>.Internal resources = null;
+            try
+            {
+                //Does versions match?
+                if (version != Const.Version)
+                    throw new Exception("Incoming server's version `" + version + "` does not match with current API version `" + Const.Version + "`");
+
+                //Is valid token?
+                if (OnValidateGameServerToken != null)
+                {
+                    if (!await OnValidateGameServerToken(ip, (ushort)gamePort, token))
+                        throw new Exception("Token was not valid!");
+                }
+
+                //Are there any connections with same IP and port?
+                {
+                    bool sessionExist = false;
+                    (TGameServer server, GameServer<TPlayer>.Internal resources) oldSession;
+
+                    //Any sessions with this IP:Port?
+                    lock (this.mActiveConnections)
+                        sessionExist = this.mActiveConnections.TryGetValue(hash, out oldSession);
+
+                    if (sessionExist)
+                    {
+                        //Close old session.
+                        oldSession.server.CloseConnection("Reconnecting.");
+
+                        //Wait until session is fully closed.
+                        while (oldSession.resources.HasActiveConnectionSession)
+                            await Task.Delay(1);
+                    }
+                }
+
+                using (var source = new CancellationTokenSource(Const.HailConnectTimeout))
+                {
+                    using (var readStream = Common.Serialization.Stream.Get())
+                    {
+                        var networkStream = client.GetStream();
+
+                        //Read is server protected
                         bool isPasswordProtected;
                         {
                             readStream.Reset();
@@ -324,10 +468,32 @@ namespace BattleBitAPI.Server
                             }
                         }
 
-                        var hash = ((ulong)gamePort << 32) | (ulong)ip.ToUInt();
-                        server = this.mInstanceDatabase.GetServerInstance(hash, out resources);
+                        //Round index
+                        uint roundIndex;
+                        {
+                            readStream.Reset();
+                            if (!await networkStream.TryRead(readStream, 4, source.Token))
+                                throw new Exception("Unable to read the Server Round Index");
+                            roundIndex = readStream.ReadUInt32();
+                        }
+
+                        //Round index
+                        long sessionID;
+                        {
+                            readStream.Reset();
+                            if (!await networkStream.TryRead(readStream, 8, source.Token))
+                                throw new Exception("Unable to read the Server Round ID");
+                            sessionID = readStream.ReadInt64();
+                        }
+
+
+
+
+
+                        server = this.mInstanceDatabase.GetServerInstance(hash, out resources, this.OnCreatingGameServerInstance, ip, (ushort)gamePort);
                         resources.Set(
                             this.mExecutePackage,
+                            this.mGetPlayerInternals,
                             client,
                             ip,
                             gamePort,
@@ -341,7 +507,9 @@ namespace BattleBitAPI.Server
                             queuePlayers,
                             maxPlayers,
                             loadingScreenText,
-                            serverRulesText
+                            serverRulesText,
+                            roundIndex,
+                            sessionID
                             );
 
                         //Room settings
@@ -388,7 +556,7 @@ namespace BattleBitAPI.Server
                         //Round Settings
                         {
                             readStream.Reset();
-                            if (!await networkStream.TryRead(readStream, GameServer<TPlayer>.mRoundSettings.Size, source.Token))
+                            if (!await networkStream.TryRead(readStream, RoundSettings<TPlayer>.mRoundSettings.Size, source.Token))
                                 throw new Exception("Unable to read the round settings");
                             resources._RoundSettings.Read(readStream);
                         }
@@ -498,19 +666,71 @@ namespace BattleBitAPI.Server
                                 wearings.Read(readStream);
                             }
 
-                            TPlayer player = mInstanceDatabase.GetPlayerInstance(steamid);
-                            player.SteamID = steamid;
-                            player.Name = username;
-                            player.IP = new IPAddress(ipHash);
-                            player.GameServer = (GameServer<TPlayer>)server;
-                            player.Team = team;
-                            player.Squad = squad;
-                            player.Role = role;
-                            player.IsAlive = isAlive;
-                            player.CurrentLoadout = loadout;
-                            player.CurrentWearings = wearings;
+
+                            TPlayer player = mInstanceDatabase.GetPlayerInstance(steamid, out var playerInternal, this.OnCreatingPlayerInstance);
+                            playerInternal.SteamID = steamid;
+                            playerInternal.Name = username;
+                            playerInternal.IP = new IPAddress(ipHash);
+                            playerInternal.Team = team;
+                            playerInternal.SquadName = squad;
+                            playerInternal.Role = role;
+                            playerInternal.IsAlive = isAlive;
+                            playerInternal.CurrentLoadout = loadout;
+                            playerInternal.CurrentWearings = wearings;
+
+                            //Modifications
+                            {
+                                readStream.Reset();
+                                if (!await networkStream.TryRead(readStream, 4, source.Token))
+                                    throw new Exception("Unable to read the Modifications Size");
+                                int modificationSize = (int)readStream.ReadUInt32();
+
+                                readStream.Reset();
+                                if (!await networkStream.TryRead(readStream, modificationSize, source.Token))
+                                    throw new Exception("Unable to read the Modifications");
+                                playerInternal._Modifications.Read(readStream);
+                            }
+
+                            playerInternal.GameServer = (GameServer<TPlayer>)server;
+                            playerInternal.SessionID = server.SessionID;
 
                             resources.AddPlayer(player);
+                        }
+
+                        //Squads
+                        {
+                            readStream.Reset();
+                            if (!await networkStream.TryRead(readStream, 4, source.Token))
+                                throw new Exception("Unable to read the Squad size");
+                            int squadsDataSize = (int)readStream.ReadUInt32();
+
+                            readStream.Reset();
+                            if (!await networkStream.TryRead(readStream, squadsDataSize, source.Token))
+                                throw new Exception("Unable to read the Squads");
+
+                            for (int i = 1; i < resources.TeamASquadInternals.Length; i++)
+                            {
+                                var item = resources.TeamASquadInternals[i];
+                                item.SquadPoints = readStream.ReadInt32();
+                            }
+                            for (int i = 1; i < resources.TeamBSquadInternals.Length; i++)
+                            {
+                                var item = resources.TeamBSquadInternals[i];
+                                item.SquadPoints = readStream.ReadInt32();
+                            }
+                        }
+
+                        // --- Finished Reading --- 
+
+                        //Assing each player to their squad.
+                        foreach (var item in resources.Players.Values)
+                        {
+                            if (item.InSquad)
+                            {
+                                var @squad = resources.GetSquadInternal(item.Squad);
+                                lock (@squad.Members)
+                                    @squad.Members.Add((TPlayer)item);
+                            }
                         }
 
                         //Send accepted notification.
@@ -535,83 +755,102 @@ namespace BattleBitAPI.Server
                 }
                 catch { }
 
+                if (this.LogLevel.HasFlag(LogLevel.Sockets))
+                    OnLog(LogLevel.Sockets, $"{ip} failed to connected because " + e.Message, client);
+
                 client.SafeClose();
                 return;
-            }
-
-            bool connectionExist = false;
-
-            //Track the connection
-            lock (this.mActiveConnections)
-            {
-                //An old connection exist with same IP + Port?
-                if (connectionExist = this.mActiveConnections.TryGetValue(server.ServerHash, out var oldServer))
-                {
-                    oldServer.resources.ReconnectFlag = true;
-                    this.mActiveConnections.Remove(server.ServerHash);
-                }
-
-                this.mActiveConnections.Add(server.ServerHash, (server, resources));
-            }
-
-            //Call the callback.
-            if (!connectionExist)
-            {
-                //New connection!
-                server.OnConnected();
-                if (this.OnGameServerConnected != null)
-                    this.OnGameServerConnected(server);
-            }
-            else
-            {
-                //Reconnection
-                server.OnReconnected();
-                if (this.OnGameServerReconnected != null)
-                    this.OnGameServerReconnected(server);
             }
 
             //Set the buffer sizes.
             client.ReceiveBufferSize = Const.MaxNetworkPackageSize;
             client.SendBufferSize = Const.MaxNetworkPackageSize;
 
+            if (this.LogLevel.HasFlag(LogLevel.Sockets))
+                OnLog(LogLevel.Sockets, $"Incoming game server from {ip}:{gamePort} accepted.", client);
+
             //Join to main server loop.
-            await mHandleGameServer(server);
+            await mHandleGameServer(server, resources);
         }
-        private async Task mHandleGameServer(TGameServer server)
+        private async Task mHandleGameServer(TGameServer server, GameServer<TPlayer>.Internal @internal)
         {
-            bool isTicking = false;
-
-            using (server)
+            @internal.HasActiveConnectionSession = true;
             {
-                async Task mTickAsync()
+                // ---- Connected ---- 
                 {
-                    isTicking = true;
-                    await server.OnTick();
-                    isTicking = false;
+                    lock (this.mActiveConnections)
+                        this.mActiveConnections.Replace(server.ServerHash, (server, @internal));
+
+                    server.OnConnected();
+                    if (this.OnGameServerConnected != null)
+                        this.OnGameServerConnected(server);
                 }
 
-                while (server.IsConnected)
+                //Update sessions
                 {
-                    if (!isTicking)
-                        mTickAsync();
+                    if (@internal.mPreviousSessionID != @internal.SessionID)
+                    {
+                        var oldSession = @internal.mPreviousSessionID;
+                        @internal.mPreviousSessionID = @internal.SessionID;
 
-                    await server.Tick();
-                    await Task.Delay(10);
+                        if (oldSession != 0)
+                            server.OnSessionChanged(oldSession, @internal.SessionID);
+                    }
+
+                    foreach (var item in @internal.Players)
+                    {
+                        var @player_internal = mInstanceDatabase.GetPlayerInternals(item.Key);
+                        if (@player_internal.PreviousSessionID != @player_internal.SessionID)
+                        {
+                            var previousID = @player_internal.PreviousSessionID;
+                            @player_internal.PreviousSessionID = @player_internal.SessionID;
+
+                            if (previousID != 0)
+                                item.Value.OnSessionChanged(previousID, @player_internal.SessionID);
+                        }
+                    }
                 }
 
-                if (!server.ReconnectFlag)
+                if (this.LogLevel.HasFlag(LogLevel.GameServers))
+                    OnLog(LogLevel.GameServers, $"{server} has connected", server);
+
+                // ---- Ticking ---- 
+                using (server)
                 {
+                    var isTicking = false;
+                    async Task mTickAsync()
+                    {
+                        isTicking = true;
+                        await server.OnTick();
+                        isTicking = false;
+                    }
+
+                    while (server.IsConnected)
+                    {
+                        if (!isTicking)
+                            mTickAsync();
+
+                        await server.Tick();
+                        await Task.Delay(10);
+                    }
+                }
+
+                // ---- Disconnected ---- 
+                {
+                    mCleanup(server, @internal);
+
+                    lock (this.mActiveConnections)
+                        this.mActiveConnections.Remove(server.ServerHash);
+
                     server.OnDisconnected();
-
                     if (this.OnGameServerDisconnected != null)
                         this.OnGameServerDisconnected(server);
                 }
-            }
 
-            //Remove from list.
-            if (!server.ReconnectFlag)
-                lock (this.mActiveConnections)
-                    this.mActiveConnections.Remove(server.ServerHash);
+                if (this.LogLevel.HasFlag(LogLevel.GameServers))
+                    OnLog(LogLevel.GameServers, $"{server} has disconnected", server);
+            }
+            @internal.HasActiveConnectionSession = false;
         }
 
         // --- Logic Executing ---
@@ -632,19 +871,35 @@ namespace BattleBitAPI.Server
                                 Squads squad = (Squads)stream.ReadInt8();
                                 GameRole role = (GameRole)stream.ReadInt8();
 
-                                TPlayer player = mInstanceDatabase.GetPlayerInstance(steamID);
-                                player.SteamID = steamID;
-                                player.Name = username;
-                                player.IP = new IPAddress(ip);
-                                player.GameServer = (GameServer<TPlayer>)server;
+                                TPlayer player = mInstanceDatabase.GetPlayerInstance(steamID, out var playerInternal, this.OnCreatingPlayerInstance);
+                                playerInternal.SteamID = steamID;
+                                playerInternal.Name = username;
+                                playerInternal.IP = new IPAddress(ip);
+                                playerInternal.Team = team;
+                                playerInternal.SquadName = squad;
+                                playerInternal.Role = role;
 
-                                player.Team = team;
-                                player.Squad = squad;
-                                player.Role = role;
+                                //Start from default.
+                                playerInternal._Modifications.Reset();
+
+                                playerInternal.GameServer = (GameServer<TPlayer>)server;
+                                playerInternal.SessionID = server.SessionID;
 
                                 resources.AddPlayer(player);
-                                server.OnPlayerConnected(player);
                                 player.OnConnected();
+                                server.OnPlayerConnected(player);
+
+                                if (playerInternal.PreviousSessionID != playerInternal.SessionID)
+                                {
+                                    var previousID = playerInternal.PreviousSessionID;
+                                    playerInternal.PreviousSessionID = playerInternal.SessionID;
+
+                                    if (previousID != 0)
+                                        player.OnSessionChanged(previousID, playerInternal.SessionID);
+                                }
+
+                                if (this.LogLevel.HasFlag(LogLevel.Players))
+                                    OnLog(LogLevel.Players, $"{player} has connected", player);
                             }
                         }
                         break;
@@ -661,8 +916,36 @@ namespace BattleBitAPI.Server
 
                             if (exist)
                             {
-                                server.OnPlayerDisconnected((TPlayer)player);
+                                var @internal = mInstanceDatabase.GetPlayerInternals(steamID);
+                                if (@internal.HP > -1f)
+                                {
+                                    @internal.OnDie();
+
+                                    player.OnDied();
+                                    server.OnPlayerDied((TPlayer)player);
+                                }
+
+                                if (@internal.SquadName != Squads.NoSquad)
+                                {
+                                    var msquad = server.GetSquad(@internal.Team, @internal.SquadName);
+                                    var rsquad = resources.GetSquadInternal(msquad);
+
+                                    @internal.SquadName = Squads.NoSquad;
+                                    lock (rsquad.Members)
+                                        rsquad.Members.Remove((TPlayer)player);
+
+                                    player.OnLeftSquad(msquad);
+                                    server.OnPlayerLeftSquad((TPlayer)player, msquad);
+                                }
+
+                                @internal.SessionID = 0;
+                                @internal.GameServer = null;
+
                                 player.OnDisconnected();
+                                server.OnPlayerDisconnected((TPlayer)player);
+
+                                if (this.LogLevel.HasFlag(LogLevel.Players))
+                                    OnLog(LogLevel.Players, $"{player} has disconnected", player);
                             }
                         }
                         break;
@@ -700,7 +983,7 @@ namespace BattleBitAPI.Server
                         }
                         break;
                     }
-                case NetworkCommuncation.OnPlayerKilledAnotherPlayer:
+                case NetworkCommuncation.OnAPlayerDownedAnotherPlayer:
                     {
                         if (stream.CanRead(8 + 12 + 8 + 12 + 2 + 1 + 1))
                         {
@@ -730,7 +1013,11 @@ namespace BattleBitAPI.Server
                                             KillerTool = tool,
                                         };
 
-                                        server.OnAPlayerKilledAnotherPlayer(args);
+                                        victimClient.OnDowned();
+                                        server.OnAPlayerDownedAnotherPlayer(args);
+
+                                        if (this.LogLevel.HasFlag(LogLevel.KillsAndSpawns))
+                                            OnLog(LogLevel.KillsAndSpawns, $"{killer} downed {victim} in {(Vector3.Distance(killerPos, victimPos))} meters", null);
                                     }
                                 }
                             }
@@ -738,7 +1025,7 @@ namespace BattleBitAPI.Server
 
                         break;
                     }
-                case NetworkCommuncation.GetPlayerStats:
+                case NetworkCommuncation.OnPlayerJoining:
                     {
                         if (stream.CanRead(8 + 2))
                         {
@@ -746,14 +1033,22 @@ namespace BattleBitAPI.Server
                             var stats = new PlayerStats();
                             stats.Read(stream);
 
+
                             async Task mHandle()
                             {
-                                stats = await server.OnGetPlayerStats(steamID, stats);
+                                var args = new PlayerJoiningArguments()
+                                {
+                                    Stats = stats,
+                                    Squad = Squads.NoSquad,
+                                    Team = Team.None
+                                };
+
+                                await server.OnPlayerJoiningToServer(steamID, args);
                                 using (var response = Common.Serialization.Stream.Get())
                                 {
                                     response.Write((byte)NetworkCommuncation.SendPlayerStats);
                                     response.Write(steamID);
-                                    stats.Write(response);
+                                    args.Write(response);
                                     server.WriteToSocket(response);
                                 }
                             }
@@ -781,13 +1076,19 @@ namespace BattleBitAPI.Server
                             ulong steamID = stream.ReadUInt64();
                             GameRole role = (GameRole)stream.ReadInt8();
 
-                            if (resources.TryGetPlayer(steamID, out var client))
+                            if (resources.TryGetPlayer(steamID, out var player))
                             {
                                 async Task mHandle()
                                 {
-                                    bool accepted = await server.OnPlayerRequestingToChangeRole((TPlayer)client, role);
+                                    if (this.LogLevel.HasFlag(LogLevel.Roles))
+                                        OnLog(LogLevel.Roles, $"{player} asking to change role to {role}", player);
+
+                                    bool accepted = await server.OnPlayerRequestingToChangeRole((TPlayer)player, role);
                                     if (accepted)
                                         server.SetRoleTo(steamID, role);
+
+                                    if (this.LogLevel.HasFlag(LogLevel.Roles))
+                                        OnLog(LogLevel.Roles, $"{player}'s request to change role to {role} was {(accepted ? "accepted" : "denied")}", player);
                                 }
 
                                 mHandle();
@@ -802,25 +1103,56 @@ namespace BattleBitAPI.Server
                             ulong steamID = stream.ReadUInt64();
                             GameRole role = (GameRole)stream.ReadInt8();
 
-                            if (resources.TryGetPlayer(steamID, out var client))
+                            if (resources.TryGetPlayer(steamID, out var player))
                             {
-                                client.Role = role;
-                                server.OnPlayerChangedRole((TPlayer)client, role);
+                                var @internal = mInstanceDatabase.GetPlayerInternals(steamID);
+                                @internal.Role = role;
+
+                                player.OnChangedRole(role);
+                                server.OnPlayerChangedRole((TPlayer)player, role);
+
+                                if (this.LogLevel.HasFlag(LogLevel.Roles))
+                                    OnLog(LogLevel.Roles, $"{player} changed role to {role}", player);
                             }
                         }
                         break;
                     }
                 case NetworkCommuncation.OnPlayerJoinedASquad:
                     {
-                        if (stream.CanRead(8 + 1))
+                        if (stream.CanRead(8 + 1 + 1))
                         {
                             ulong steamID = stream.ReadUInt64();
                             Squads squad = (Squads)stream.ReadInt8();
+                            bool asCaptain = stream.ReadBool();
 
-                            if (resources.TryGetPlayer(steamID, out var client))
+                            if (resources.TryGetPlayer(steamID, out var player))
                             {
-                                client.Squad = squad;
-                                server.OnPlayerJoinedSquad((TPlayer)client, squad);
+                                var @internal = mInstanceDatabase.GetPlayerInternals(steamID);
+                                @internal.SquadName = squad;
+
+                                var msquad = server.GetSquad(player.Team, squad);
+                                var rsquad = resources.GetSquadInternal(msquad);
+                                lock (rsquad.Members)
+                                    rsquad.Members.Add((TPlayer)player);
+
+                                //Assign as leader if needed.
+                                if (asCaptain)
+                                    rsquad.SquadLeader = steamID;
+
+                                player.OnJoinedSquad(msquad);
+                                server.OnPlayerJoinedSquad((TPlayer)player, msquad);
+
+                                if (this.LogLevel.HasFlag(LogLevel.Squads))
+                                    OnLog(LogLevel.Squads, $"{player} has joined to {msquad}", msquad);
+
+                                if (asCaptain)
+                                {
+                                    player.OnPlayerPromotedToSquadLeader();
+                                    server.OnSquadLeaderChanged(msquad, (TPlayer)player);
+
+                                    if (this.LogLevel.HasFlag(LogLevel.Squads))
+                                        OnLog(LogLevel.Squads, $"{player} has promoted to squad leader", player);
+                                }
                             }
                         }
                         break;
@@ -831,16 +1163,33 @@ namespace BattleBitAPI.Server
                         {
                             ulong steamID = stream.ReadUInt64();
 
-                            if (resources.TryGetPlayer(steamID, out var client))
+                            if (resources.TryGetPlayer(steamID, out var player))
                             {
-                                var oldSquad = client.Squad;
-                                var oldRole = client.Role;
-                                client.Squad = Squads.NoSquad;
-                                client.Role = GameRole.Assault;
+                                var @internal = mInstanceDatabase.GetPlayerInternals(steamID);
 
-                                server.OnPlayerLeftSquad((TPlayer)client, oldSquad);
+                                var oldSquad = player.SquadName;
+                                var oldRole = player.Role;
+                                @internal.SquadName = Squads.NoSquad;
+                                @internal.Role = GameRole.Assault;
+
+                                var msquad = server.GetSquad(player.Team, oldSquad);
+                                var rsquad = resources.GetSquadInternal(msquad);
+
+                                @internal.SquadName = Squads.NoSquad;
+                                lock (rsquad.Members)
+                                    rsquad.Members.Remove((TPlayer)player);
+
+                                player.OnLeftSquad(msquad);
+                                server.OnPlayerLeftSquad((TPlayer)player, msquad);
+
                                 if (oldRole != GameRole.Assault)
-                                    server.OnPlayerChangedRole((TPlayer)client, GameRole.Assault);
+                                {
+                                    player.OnChangedRole(GameRole.Assault);
+                                    server.OnPlayerChangedRole((TPlayer)player, GameRole.Assault);
+                                }
+
+                                if (this.LogLevel.HasFlag(LogLevel.Squads))
+                                    OnLog(LogLevel.Squads, $"{player} has left the {msquad}", msquad);
                             }
                         }
                         break;
@@ -854,7 +1203,11 @@ namespace BattleBitAPI.Server
 
                             if (resources.TryGetPlayer(steamID, out var client))
                             {
-                                client.Team = team;
+                                var @internal = mInstanceDatabase.GetPlayerInternals(steamID);
+
+                                @internal.Team = team;
+
+                                client.OnChangedTeam();
                                 server.OnPlayerChangeTeam((TPlayer)client, team);
                             }
                         }
@@ -866,25 +1219,47 @@ namespace BattleBitAPI.Server
                         {
                             ulong steamID = stream.ReadUInt64();
 
-                            var request = new OnPlayerSpawnArguments();
+                            OnPlayerSpawnArguments request = new OnPlayerSpawnArguments();
                             request.Read(stream);
                             ushort vehicleID = stream.ReadUInt16();
 
-                            if (resources.TryGetPlayer(steamID, out var client))
+                            if (resources.TryGetPlayer(steamID, out var player))
                             {
                                 async Task mHandle()
                                 {
-                                    request = await server.OnPlayerSpawning((TPlayer)client, request);
+                                    if (this.LogLevel.HasFlag(LogLevel.KillsAndSpawns))
+                                        OnLog(LogLevel.KillsAndSpawns, $"{player} asking to spawn at {request.SpawnPosition} ({request.RequestedPoint})", player);
+
+                                    var responseSpawn = await server.OnPlayerSpawning((TPlayer)player, request);
 
                                     //Respond back.
                                     using (var response = Common.Serialization.Stream.Get())
                                     {
                                         response.Write((byte)NetworkCommuncation.SpawnPlayer);
                                         response.Write(steamID);
-                                        request.Write(response);
-                                        response.Write(vehicleID);
+
+                                        if (responseSpawn != null)
+                                        {
+                                            response.Write(true);
+                                            responseSpawn.Value.Write(response);
+                                            response.Write(vehicleID);
+                                        }
+                                        else
+                                        {
+                                            response.Write(false);
+                                        }
+
                                         server.WriteToSocket(response);
                                     }
+
+                                    if (this.LogLevel.HasFlag(LogLevel.KillsAndSpawns))
+                                    {
+                                        if (responseSpawn == null)
+                                            OnLog(LogLevel.KillsAndSpawns, $"{player}'s spawn request was denied", player);
+                                        else
+                                            OnLog(LogLevel.KillsAndSpawns, $"{player}'s spawn request was accepted at {responseSpawn.Value.SpawnPosition}", player);
+                                    }
+
                                 }
 
                                 mHandle();
@@ -915,21 +1290,34 @@ namespace BattleBitAPI.Server
                     {
                         if (stream.CanRead(8 + 2))
                         {
-                            ulong reporter = stream.ReadUInt64();
-                            if (resources.TryGetPlayer(reporter, out var client))
+                            ulong steamID = stream.ReadUInt64();
+                            if (resources.TryGetPlayer(steamID, out var player))
                             {
+                                var @internal = mInstanceDatabase.GetPlayerInternals(steamID);
+
                                 var loadout = new PlayerLoadout();
                                 loadout.Read(stream);
-                                client.CurrentLoadout = loadout;
+                                @internal.CurrentLoadout = loadout;
 
                                 var wearings = new PlayerWearings();
                                 wearings.Read(stream);
-                                client.CurrentWearings = wearings;
+                                @internal.CurrentWearings = wearings;
 
-                                client.IsAlive = true;
+                                Vector3 position = new Vector3()
+                                {
+                                    X = stream.ReadFloat(),
+                                    Y = stream.ReadFloat(),
+                                    Z = stream.ReadFloat(),
+                                };
 
-                                client.OnSpawned();
-                                server.OnPlayerSpawned((TPlayer)client);
+                                @internal.Position = position;
+                                @internal.IsAlive = true;
+
+                                player.OnSpawned();
+                                server.OnPlayerSpawned((TPlayer)player);
+
+                                if (this.LogLevel.HasFlag(LogLevel.KillsAndSpawns))
+                                    OnLog(LogLevel.KillsAndSpawns, $"{player} has spawned at {player.Position}", player);
                             }
                         }
                         break;
@@ -938,15 +1326,17 @@ namespace BattleBitAPI.Server
                     {
                         if (stream.CanRead(8))
                         {
-                            ulong reporter = stream.ReadUInt64();
-                            if (resources.TryGetPlayer(reporter, out var client))
+                            ulong steamid = stream.ReadUInt64();
+                            if (resources.TryGetPlayer(steamid, out var player))
                             {
-                                client.CurrentLoadout = new PlayerLoadout();
-                                client.CurrentWearings = new PlayerWearings();
-                                client.IsAlive = false;
+                                var @internal = mInstanceDatabase.GetPlayerInternals(steamid);
+                                @internal.OnDie();
 
-                                client.OnDied();
-                                server.OnPlayerDied((TPlayer)client);
+                                player.OnDied();
+                                server.OnPlayerDied((TPlayer)player);
+
+                                if (this.LogLevel.HasFlag(LogLevel.KillsAndSpawns))
+                                    OnLog(LogLevel.KillsAndSpawns, $"{player} has died", player);
                             }
                         }
                         break;
@@ -989,7 +1379,7 @@ namespace BattleBitAPI.Server
                     }
                 case NetworkCommuncation.NotifyNewRoundState:
                     {
-                        if (stream.CanRead(GameServer<TPlayer>.mRoundSettings.Size))
+                        if (stream.CanRead(RoundSettings<TPlayer>.mRoundSettings.Size))
                         {
                             var oldState = resources._RoundSettings.State;
                             resources._RoundSettings.Read(stream);
@@ -1007,7 +1397,237 @@ namespace BattleBitAPI.Server
                         }
                         break;
                     }
+                case NetworkCommuncation.OnPlayerAskingToChangeTeam:
+                    {
+                        if (stream.CanRead(8 + 1))
+                        {
+                            ulong steamID = stream.ReadUInt64();
+                            Team team = (Team)stream.ReadInt8();
+
+                            if (resources.TryGetPlayer(steamID, out var client))
+                            {
+                                async Task mHandle()
+                                {
+                                    bool accepted = await server.OnPlayerRequestingToChangeTeam((TPlayer)client, team);
+                                    if (accepted)
+                                        server.ChangeTeam(steamID, team);
+                                }
+
+                                mHandle();
+                            }
+                        }
+                        break;
+                    }
+                case NetworkCommuncation.GameTick:
+                    {
+                        if (stream.CanRead(4 + 4 + 4))
+                        {
+                            float decompressX = stream.ReadFloat();
+                            float decompressY = stream.ReadFloat();
+                            float decompressZ = stream.ReadFloat();
+
+                            int playerCount = stream.ReadInt8();
+                            while (playerCount > 0)
+                            {
+                                playerCount--;
+                                ulong steamID = stream.ReadUInt64();
+
+                                //TODO, can compressed further later.
+                                ushort com_posX = stream.ReadUInt16();
+                                ushort com_posY = stream.ReadUInt16();
+                                ushort com_posZ = stream.ReadUInt16();
+                                byte com_healt = stream.ReadInt8();
+                                PlayerStand standing = (PlayerStand)stream.ReadInt8();
+                                LeaningSide side = (LeaningSide)stream.ReadInt8();
+                                LoadoutIndex loadoutIndex = (LoadoutIndex)stream.ReadInt8();
+                                bool inSeat = stream.ReadBool();
+                                bool isBleeding = stream.ReadBool();
+                                ushort ping = stream.ReadUInt16();
+
+                                var @internal = mInstanceDatabase.GetPlayerInternals(steamID);
+                                if (@internal.IsAlive)
+                                {
+                                    float newHP = (com_healt * 0.5f) - 1f;
+
+                                    if (this.LogLevel.HasFlag(LogLevel.HealtChanges))
+                                    {
+                                        var player = resources.Players[steamID];
+                                        float dtHP = newHP - @internal.HP;
+                                        if (dtHP > 0)
+                                        {
+                                            //Heal
+                                            OnLog(LogLevel.HealtChanges, $"{player} was healed by {dtHP} HP (new HP is {newHP} HP)", player);
+                                        }
+                                        else if (dtHP < 0)
+                                        {
+                                            //Damage
+                                            OnLog(LogLevel.HealtChanges, $"{player} was damaged by {(-dtHP)} HP (new HP is {newHP} HP)", player);
+                                        }
+                                    }
+
+                                    @internal.Position = new Vector3()
+                                    {
+                                        X = com_posX * decompressX,
+                                        Y = com_posY * decompressY,
+                                        Z = com_posZ * decompressZ,
+                                    };
+                                    @internal.HP = newHP;
+                                    @internal.Standing = standing;
+                                    @internal.Leaning = side;
+                                    @internal.CurrentLoadoutIndex = loadoutIndex;
+                                    @internal.InVehicle = inSeat;
+                                    @internal.IsBleeding = isBleeding;
+                                    @internal.PingMs = ping;
+
+                                }
+                            }
+                        }
+                        break;
+                    }
+                case NetworkCommuncation.OnPlayerGivenUp:
+                    {
+                        if (stream.CanRead(8))
+                        {
+                            ulong steamID = stream.ReadUInt64();
+                            if (resources.TryGetPlayer(steamID, out var player))
+                            {
+                                player.OnGivenUp();
+                                server.OnPlayerGivenUp((TPlayer)player);
+
+                                if (this.LogLevel.HasFlag(LogLevel.KillsAndSpawns))
+                                    OnLog(LogLevel.KillsAndSpawns, $"{player} has givenup", player);
+                            }
+                        }
+                        break;
+                    }
+                case NetworkCommuncation.OnPlayerRevivedAnother:
+                    {
+                        if (stream.CanRead(8 + 8))
+                        {
+                            ulong from = stream.ReadUInt64();
+                            ulong to = stream.ReadUInt64();
+                            if (resources.TryGetPlayer(to, out var toClient))
+                            {
+                                toClient.OnRevivedByAnotherPlayer();
+
+                                if (resources.TryGetPlayer(from, out var fromClient))
+                                {
+                                    fromClient.OnRevivedAnotherPlayer();
+                                    server.OnAPlayerRevivedAnotherPlayer((TPlayer)fromClient, (TPlayer)toClient);
+
+                                    if (this.LogLevel.HasFlag(LogLevel.KillsAndSpawns))
+                                        OnLog(LogLevel.KillsAndSpawns, $"{fromClient} revived {toClient}", null);
+                                }
+                            }
+                        }
+                        break;
+                    }
+                case NetworkCommuncation.OnSquadPointsChanged:
+                    {
+                        if (stream.CanRead(1 + 1 + 4))
+                        {
+                            Team team = (Team)stream.ReadInt8();
+                            Squads squad = (Squads)stream.ReadInt8();
+                            int points = stream.ReadInt32();
+
+                            var msquad = server.GetSquad(team, squad);
+                            var rsquad = resources.GetSquadInternal(msquad);
+
+                            if (rsquad.SquadPoints != points)
+                            {
+                                rsquad.SquadPoints = points;
+                                server.OnSquadPointsChanged(msquad, points);
+                            }
+
+                            if (this.LogLevel.HasFlag(LogLevel.Squads))
+                                OnLog(LogLevel.Squads, $"{msquad} now has {points} points", msquad);
+                        }
+                        break;
+                    }
+                case NetworkCommuncation.NotifyNewRoundID:
+                    {
+                        if (stream.CanRead(4 + 8))
+                        {
+                            resources.RoundIndex = stream.ReadUInt32();
+                            resources.SessionID = stream.ReadInt64();
+
+                            if (resources.mPreviousSessionID != resources.SessionID)
+                            {
+                                var oldSession = resources.mPreviousSessionID;
+                                resources.mPreviousSessionID = resources.SessionID;
+
+                                if (oldSession != 0)
+                                    server.OnSessionChanged(oldSession, resources.SessionID);
+                            }
+
+                            foreach (var item in resources.Players)
+                            {
+                                var @player_internal = mInstanceDatabase.GetPlayerInternals(item.Key);
+                                @player_internal.SessionID = resources.SessionID;
+
+                                if (@player_internal.PreviousSessionID != @player_internal.SessionID)
+                                {
+                                    var previousID = @player_internal.PreviousSessionID;
+                                    @player_internal.PreviousSessionID = @player_internal.SessionID;
+
+                                    if (previousID != 0)
+                                        item.Value.OnSessionChanged(previousID, @player_internal.SessionID);
+                                }
+                            }
+                        }
+                        break;
+                    }
+                case NetworkCommuncation.Log:
+                    {
+                        if (this.LogLevel.HasFlag(LogLevel.GameServerErrors))
+                        {
+                            if (stream.TryReadString(out var log))
+                                OnLog(LogLevel.GameServerErrors, log, server);
+                        }
+                        break;
+                    }
+                case NetworkCommuncation.OnSquadLeaderChanged:
+                    {
+                        if (stream.CanRead(8 + 1))
+                        {
+                            ulong steamID = stream.ReadUInt64();
+                            byte squadIndex = stream.ReadInt8();
+
+                            if (resources.TryGetPlayer(steamID, out var player))
+                            {
+                                var msquad = server.GetSquad(player.Team, (Squads)squadIndex);
+                                var rsquad = resources.GetSquadInternal(msquad);
+
+                                rsquad.SquadLeader = steamID;
+
+                                player.OnPlayerPromotedToSquadLeader();
+                                server.OnSquadLeaderChanged(msquad, (TPlayer)player);
+
+                                if (this.LogLevel.HasFlag(LogLevel.Squads))
+                                    OnLog(LogLevel.Squads, $"{player} has promoted to squad leader", player);
+                            }
+                        }
+                        break;
+                    }
             }
+        }
+
+        // --- Private ---
+        private void mCleanup(GameServer<TPlayer> server, GameServer<TPlayer>.Internal @internal)
+        {
+            lock (@internal.Players)
+            {
+                foreach (var item in @internal.Players)
+                {
+                    var @player_internal = mInstanceDatabase.GetPlayerInternals(item.Key);
+                    @player_internal.SessionID = 0;
+                    @player_internal.GameServer = null;
+                }
+            }
+        }
+        private Player<TPlayer>.Internal mGetPlayerInternals(ulong steamID)
+        {
+            return mInstanceDatabase.GetPlayerInternals(steamID);
         }
 
         // --- Public ---
@@ -1015,13 +1635,17 @@ namespace BattleBitAPI.Server
         {
             get
             {
-                var list = new List<TGameServer>(mActiveConnections.Count);
-                lock (mActiveConnections)
+                using (var list = this.mGameServerPool.Get())
                 {
-                    foreach (var item in mActiveConnections.Values)
-                        list.Add(item.server);
+                    //Get a copy
+                    lock (mActiveConnections)
+                        foreach (var item in mActiveConnections.Values)
+                            list.ListItems.Add(item.server);
+
+                    //Iterate
+                    for (int i = 0; i < list.ListItems.Count; i++)
+                        yield return (TGameServer)list.ListItems[i];
                 }
-                return list;
             }
         }
         public bool TryGetGameServer(IPAddress ip, ushort port, out TGameServer server)
@@ -1056,15 +1680,15 @@ namespace BattleBitAPI.Server
         private class mInstances<TPlayer, TGameServer> where TPlayer : Player<TPlayer> where TGameServer : GameServer<TPlayer>
         {
             private Dictionary<ulong, (TGameServer, GameServer<TPlayer>.Internal)> mGameServerInstances;
-            private Dictionary<ulong, TPlayer> mPlayerInstances;
+            private Dictionary<ulong, (TPlayer, Player<TPlayer>.Internal)> mPlayerInstances;
 
             public mInstances()
             {
                 this.mGameServerInstances = new Dictionary<ulong, (TGameServer, GameServer<TPlayer>.Internal)>(64);
-                this.mPlayerInstances = new Dictionary<ulong, TPlayer>(1024 * 16);
+                this.mPlayerInstances = new Dictionary<ulong, (TPlayer, Player<TPlayer>.Internal)>(1024 * 16);
             }
 
-            public TGameServer GetServerInstance(ulong hash, out GameServer<TPlayer>.Internal @internal)
+            public TGameServer GetServerInstance(ulong hash, out GameServer<TPlayer>.Internal @internal, Func<IPAddress, ushort, TGameServer> createFunc, IPAddress ip, ushort port)
             {
                 lock (mGameServerInstances)
                 {
@@ -1074,25 +1698,48 @@ namespace BattleBitAPI.Server
                         return data.Item1;
                     }
 
-                    @internal = new GameServer<TPlayer>.Internal();
-                    TGameServer gameServer = GameServer<TPlayer>.CreateInstance<TGameServer>(@internal);
+                    GameServer<TPlayer> server;
+                    if (createFunc != null)
+                        server = createFunc(ip, port);
+                    else
+                        server = Activator.CreateInstance<TGameServer>();
 
-                    mGameServerInstances.Add(hash, (gameServer, @internal));
-                    return gameServer;
+                    @internal = new GameServer<TPlayer>.Internal(server);
+
+                    GameServer<TPlayer>.SetInstance(server, @internal);
+
+                    mGameServerInstances.Add(hash, ((TGameServer)server, @internal));
+                    return (TGameServer)server;
                 }
             }
-            public TPlayer GetPlayerInstance(ulong steamID)
+            public TPlayer GetPlayerInstance(ulong steamID, out Player<TPlayer>.Internal @internal, Func<ulong, TPlayer> createFunc)
             {
                 lock (this.mPlayerInstances)
                 {
                     if (this.mPlayerInstances.TryGetValue(steamID, out var player))
-                        return player;
+                    {
+                        @internal = player.Item2;
+                        return player.Item1;
+                    }
 
-                    player = Activator.CreateInstance<TPlayer>();
-                    player.OnCreated();
-                    mPlayerInstances.Add(steamID, player);
-                    return player;
+                    @internal = new Player<TPlayer>.Internal();
+
+                    Player<TPlayer> pplayer;
+
+                    if (createFunc != null)
+                        pplayer = createFunc(steamID);
+                    else
+                        pplayer = Activator.CreateInstance<TPlayer>();
+                    Player<TPlayer>.SetInstance((TPlayer)pplayer, @internal);
+
+                    mPlayerInstances.Add(steamID, ((TPlayer)pplayer, @internal));
+                    return (TPlayer)pplayer;
                 }
+            }
+            public Player<TPlayer>.Internal GetPlayerInternals(ulong steamID)
+            {
+                lock (mPlayerInstances)
+                    return mPlayerInstances[steamID].Item2;
             }
         }
     }
